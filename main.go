@@ -4,8 +4,11 @@ import (
 	//"bufio"
 	"encoding/json"
 	"flag"
+	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -27,6 +30,14 @@ type History struct {
 	Added      time.Time
 }
 
+type Tokens struct {
+	_Token       string `json:"//token"`
+	_TokenPhone  string `json:"//token_phone"`
+	_TokenPhone2 string `json:"//token_phone2"`
+	Token        string `json:"token"`
+	TokenPhone   string `json:"token_phone"`
+}
+
 var hist []History
 
 var conf = "tidl-config.json"
@@ -39,6 +50,7 @@ var onlyEPs = flag.Bool("eps", false, "only download eps and singles")
 var onlyPlayLists = flag.Bool("playlist", false, "only download specified playlist")
 var onlyClean = flag.Bool("clean", false, "only download clean(i.e. non-Explicit) tracks")
 var mqa = flag.Bool("mqa", false, "Prefer MQA over FLAC Quality")
+var track = flag.String("track", "", "Single Track Grab")
 
 func grabSavedAlbums(t *Tidal, ids []string) error {
 
@@ -202,6 +214,27 @@ func main() {
 	/* Log better */
 	log.SetFlags(log.LstdFlags | log.Ldate | log.Lmicroseconds | log.Lshortfile)
 
+	log.Printf("INFO: Checking for newer API access token...")
+	resp, e := http.Get(tokenurl)
+	if e != nil {
+		log.Printf("ERROR: While trying to access updated token list (%v) (URL: %v)", e, tokenurl)
+		log.Printf("INFO: Attempting statically defined token for login (%v)", atoken)
+	} else {
+		defer resp.Body.Close()
+		body, e := ioutil.ReadAll(resp.Body)
+		if e != nil {
+			log.Printf("Error: %v", e)
+		}
+		var newtokens Tokens
+		e = json.Unmarshal(body, &newtokens)
+		if e != nil {
+			log.Printf("ERROR: %v", e)
+		} else {
+			atoken = newtokens.Token
+			log.Printf("INFO: Using token from online update (%v)", atoken)
+		}
+	}
+
 	//var hist []History
 	//var history []History
 	var err error
@@ -244,10 +277,67 @@ func main() {
 
 	t, err := New(config.Username, config.Password)
 	if err != nil {
-		log.Println("can't login to tidl right now")
+		log.Printf("ERROR: can't login to tidl right now (%v)", err)
 		os.Exit(4)
 	}
 	log.Printf("INFO: Logged into Tidal %v, user id %v - got Session ID [%v]", t.CountryCode, t.UserID.String(), t.SessionID)
+
+	if *track != "" {
+		if strings.Contains(*track, "https://tidal.com/browse/track/") {
+			*track = strings.Replace(*track, "https://tidal.com/browse/track/", "", -1)
+		}
+		// https://tidal.com/browse/track/144280950
+		var ttrack Track
+
+		err := t.get("tracks/"+*track, &url.Values{}, &ttrack)
+		//log.Printf("%#v", ttrack)
+		u, err := t.GetStreamURL(ttrack.ID.String(), "LOSSLESS")
+		if err != nil {
+			log.Printf("%#v", err)
+			os.Exit(1)
+		}
+		if u != "" {
+			res, err := http.Get(u)
+			if err != nil {
+				log.Printf("%#v", err)
+				os.Exit(1)
+			}
+			//log.Printf("%#v", res)
+			dirs := "./"
+			var tracknum string
+			//if tr.PartOfPlaylist == false {
+			tint, _ := ttrack.TrackNumber.Int64()
+			if tint < 10 {
+				tracknum = "0" + ttrack.TrackNumber.String()
+			} else {
+				tracknum = ttrack.TrackNumber.String()
+			}
+			path := dirs + "/" + tracknum + " - " + clean(ttrack.Artist.Name) + " - " + clean(ttrack.Title)
+			_, err = os.Stat("./" + path + ".flac")
+			if !os.IsNotExist(err) {
+				os.Exit(0)
+			}
+			f, err := os.Create(path)
+			if err != nil {
+				log.Printf("%#v", err)
+				os.Exit(1)
+			}
+			io.Copy(f, res.Body)
+			res.Body.Close()
+			f.Close()
+			err = enc(dirs, ttrack)
+			if err != nil {
+				if strings.Contains(err.Error(), "flac.parseStreamInfo: invalid FLAC signature; expected") {
+					// this isn't a flac file.  return
+					log.Printf("ERROR: File %v isn't a FLAC file, removing and continuing.", path)
+				} else {
+					log.Printf("ERROR: %#v", err)
+				}
+			}
+			os.Remove(path)
+		}
+		os.Exit(0)
+	}
 
 	var ids []string
 
